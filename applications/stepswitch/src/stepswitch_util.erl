@@ -16,6 +16,16 @@
 -export([resources_to_endpoints/3]).
 -export([json_to_template_props/1]).
 
+-ifdef(TEST).
+-export([maybe_constrain_shortdial_correction/1
+        ,shortdial_correction_length/2
+        ,maybe_deny_reclassified_number/3
+        ,do_correct_shortdial/3
+        ,should_correct_shortdial/1
+        ,correct_shortdial/4
+        ]).
+-endif.
+
 -include("stepswitch.hrl").
 -include_lib("kazoo_stdlib/include/kazoo_json.hrl").
 -include_lib("kazoo_amqp/include/kapi_offnet_resource.hrl").
@@ -91,6 +101,10 @@ correct_shortdial(<<"+", Number/binary>>, CIDNum, DeniedCallRestrictions) ->
 correct_shortdial(Number, <<"+", CIDNum/binary>>, DeniedCallRestrictions) ->
     correct_shortdial(Number, CIDNum, DeniedCallRestrictions);
 correct_shortdial(Number, CIDNum, DeniedCallRestrictions) when is_binary(CIDNum) ->
+    correct_shortdial(Number, CIDNum, DeniedCallRestrictions, should_correct_shortdial(Number)).
+
+-spec correct_shortdial(kz_term:ne_binary(), kz_term:ne_binary(), kz_json:object(), {boolean(), pos_integer()}) -> kz_term:api_ne_binary().
+correct_shortdial(Number, CIDNum, DeniedCallRestrictions, {'true', _Length}) ->
     case shortdial_correction_length(Number, CIDNum) of
         0 ->
             lager:debug("unable to correct shortdial ~s via CID ~s"
@@ -98,34 +112,47 @@ correct_shortdial(Number, CIDNum, DeniedCallRestrictions) when is_binary(CIDNum)
                        ),
             'undefined';
         Length ->
-            try_to_correct(Number, CIDNum, DeniedCallRestrictions, Length)
-    end.
+            maybe_deny_reclassified_number(do_correct_shortdial(Number, CIDNum, Length)
+                                          ,CIDNum
+                                          ,DeniedCallRestrictions
+                                          )
+    end;
+correct_shortdial(Number, _CIDNum, _DeniedCallRestrictions, {'false', Length}) ->
+    lager:debug("~s's lenght (~p) doesn't match shortdial_correction_if_length_is param's value (~p), skipping"
+               ,[Number, byte_size(Number), Length]
+               ),
+    'undefined'.
 
--spec try_to_correct(kz_term:ne_binary(), kz_term:ne_binary(), kz_json:object(), non_neg_integer()) -> kz_term:api_ne_binary().
-try_to_correct(Number, CIDNum, DeniedCallRestrictions, Length) ->
+-spec should_correct_shortdial(kz_term:ne_binary()) -> {boolean(), pos_integer()}.
+should_correct_shortdial(Number) ->
+    Length = kapps_config:get_integer(?SS_CONFIG_CAT, <<"shortdial_correction_if_length_is">>, 0),
+    %% The length is also included on the response just to avoid having to read this configuration
+    %% parameter again when printing the debug line. So it is only useful for the `{false, N}' branch.
+    {0 =:= Length
+     orelse byte_size(Number) =:= Length
+    ,Length
+    }.
+
+-spec do_correct_shortdial(kz_term:ne_binary(), kz_term:ne_binary(), non_neg_integer()) -> kz_term:api_ne_binary().
+do_correct_shortdial(Number, CIDNum, Length) ->
     Correction = kz_binary:truncate_right(CIDNum, Length),
     CorrectedNumber = knm_converters:normalize(<<Correction/binary, Number/binary>>),
-    lager:debug("corrected shortdial ~s via CID ~s to ~s"
-               ,[Number, CIDNum, CorrectedNumber]
-               ),
-    case should_deny_reclassified_number(CorrectedNumber, DeniedCallRestrictions) of
-        'true' ->
-            lager:info("unable to correct shortdial ~s via CID ~s due to a call restriction"
-                      ,[Number, CIDNum]
-                      ),
-            'undefined';
-        'false' ->
-            CorrectedNumber
-    end.
+    lager:debug("corrected shortdial ~s via CID ~s to ~s", [Number, CIDNum, CorrectedNumber]),
+    CorrectedNumber.
 
--spec should_deny_reclassified_number(kz_term:ne_binary(), kz_json:object()) -> boolean().
-should_deny_reclassified_number(CorrectedNumber, DeniedCallRestrictions) ->
+-spec maybe_deny_reclassified_number(kz_term:ne_binary(), kz_term:ne_binary(), kz_json:objects()) -> kz_term:api_binary().
+maybe_deny_reclassified_number(CorrectedNumber, CIDNum, DeniedCallRestrictions) ->
     Classification = knm_converters:classify(CorrectedNumber),
     lager:debug("re-classified corrected number ~s as ~s, testing for call restrictions"
                ,[CorrectedNumber, Classification]
                ),
-    kz_json:get_ne_binary_value([Classification, <<"action">>], DeniedCallRestrictions)
-        =:= <<"deny">>.
+    case kz_json:get_ne_binary_value([Classification, <<"action">>], DeniedCallRestrictions) of
+        <<"deny">> ->
+            lager:info("unable to correct shortdial via CID ~s due to a call restriction", [CIDNum]),
+            'undefined';
+        _ ->
+            CorrectedNumber
+    end.
 
 -spec shortdial_correction_length(kz_term:ne_binary(), kz_term:ne_binary()) -> integer().
 shortdial_correction_length(Number, CIDNum) ->
